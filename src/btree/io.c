@@ -53,6 +53,11 @@
 #include "utils/syscache.h"
 #include "funcapi.h"
 
+#if defined(__x86_64__) && defined(HAVE__GET_CPUID) && __has_attribute(target)
+#define USE_AVX2_CHECKSUM_WITH_RUNTIME_CHECK
+#include <cpuid.h>
+#endif
+
 static int	btree_smgr_read(BTreeDescr *desc, char *buffer, uint32 chkpNum,
 							int amount, off_t offset);
 
@@ -1276,8 +1281,8 @@ oriole_checksum_block_len(uint32 blk_size)
  * Block checksum algorithm.  The page must be adequately aligned
  * (at least on 4-byte boundary).
  */
-static inline uint32
-oriole_checksum_block(const OrioleDBChecksummablePage *page, uint32 len)
+static pg_always_inline uint32
+oriole_checksum_block_impl(const OrioleDBChecksummablePage *page, uint32 len)
 {
 	uint32		sums[N_SUMS];
 	uint32		result = 0;
@@ -1302,6 +1307,76 @@ oriole_checksum_block(const OrioleDBChecksummablePage *page, uint32 len)
 		result ^= sums[i];
 
 	return result;
+}
+
+static uint32
+oriole_checksum_block_fallback(const OrioleDBChecksummablePage *page, uint32 len)
+{
+	return oriole_checksum_block_impl(page, len);
+}
+
+#ifdef USE_AVX2_CHECKSUM_WITH_RUNTIME_CHECK
+/*
+ * The same algorithm compiled for AVX2, which adds 256-bit registers and a
+ * 32-bit vector multiply that SSE2 lacks.
+ */
+__attribute__((target("avx2")))
+static uint32
+oriole_checksum_block_avx2(const OrioleDBChecksummablePage *page, uint32 len)
+{
+	return oriole_checksum_block_impl(page, len);
+}
+
+/*
+ * Does the CPU support AVX2, and does the OS save the YMM registers?
+ */
+static bool
+avx2_available(void)
+{
+	unsigned int eax,
+				ebx,
+				ecx,
+				edx;
+
+	if (__get_cpuid_max(0, NULL) < 7)
+		return false;
+
+	__cpuid(1, eax, ebx, ecx, edx);
+	if ((ecx & bit_OSXSAVE) == 0)
+		return false;
+
+	/* XCR0 bits 1 and 2: the OS saves the XMM and YMM registers */
+	__asm__ __volatile__("xgetbv"
+:						 "=a"(eax), "=d"(edx)
+:						 "c"(0));
+	if ((eax & 0x6) != 0x6)
+		return false;
+
+	__cpuid_count(7, 0, eax, ebx, ecx, edx);
+	return (ebx & bit_AVX2) != 0;
+}
+#endif
+
+static uint32 oriole_checksum_block_choose(const OrioleDBChecksummablePage *page,
+										   uint32 len);
+
+static uint32 (*oriole_checksum_block) (const OrioleDBChecksummablePage *page,
+										uint32 len) = oriole_checksum_block_choose;
+
+/*
+ * Choose the checksum implementation on first use.
+ */
+static uint32
+oriole_checksum_block_choose(const OrioleDBChecksummablePage *page, uint32 len)
+{
+	oriole_checksum_block = oriole_checksum_block_fallback;
+
+#ifdef USE_AVX2_CHECKSUM_WITH_RUNTIME_CHECK
+	if (avx2_available())
+		oriole_checksum_block = oriole_checksum_block_avx2;
+#endif
+
+	return oriole_checksum_block(page, len);
 }
 
 static bool
